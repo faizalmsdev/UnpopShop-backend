@@ -1,0 +1,374 @@
+// Unpop.shop database schema
+// Default datasource is SQLite for zero-setup local development.
+// For production, change provider to "postgresql" and point DATABASE_URL
+// at a real Postgres instance -- the schema itself is portable.
+//
+// NOTE: SQLite's Prisma connector does not support native enums, so every
+// enum below has been converted to a String field with the same default
+// value. The set of valid values is enforced at the application layer
+// (e.g. a TS union type / Zod schema) instead of by the database.
+// If you later switch `provider` to "postgresql", you can restore these
+// as real `enum` blocks and change the field types back if you want
+// DB-level enforcement -- the rest of the schema doesn't need to change.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Auth / identity
+// ---------------------------------------------------------------------------
+
+// Role: BUYER | MANUFACTURER | ADMIN
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  role         String
+  name         String
+  phone        String?
+  country      String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  buyerProfile        BuyerProfile?
+  manufacturerProfile ManufacturerProfile?
+
+  favorites   Favorite[]
+  enquiries   Enquiry[]
+  rfqs        RFQ[]
+  messagesSent     Message[] @relation("MessageSender")
+  messagesReceived Message[] @relation("MessageReceiver")
+  ordersAsBuyer    Order[]   @relation("OrderBuyer")
+  notifications    Notification[]
+}
+
+model BuyerProfile {
+  id          String  @id @default(cuid())
+  userId      String  @unique
+  user        User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  companyName String
+  country     String
+  city        String?
+  industry    String?
+  website     String?
+
+  orders Order[]
+}
+
+// VerificationStatus: PENDING | VERIFIED | REJECTED
+model ManufacturerProfile {
+  id                 String              @id @default(cuid())
+  userId             String              @unique
+  user               User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  companyName        String
+  description        String?
+  logoUrl            String?
+  country            String              @default("India")
+  state              String?
+  city                String?
+  gstNumber          String?
+  certifications     String? // comma-separated
+  exportMarkets      String? // comma-separated country codes/names
+  productionCapacity String?
+  verificationStatus String              @default("PENDING")
+
+  subscriptionPlanId String?
+  subscriptionPlan   SubscriptionPlan?   @relation(fields: [subscriptionPlanId], references: [id])
+  listingLimit       Int                 @default(5)
+  subscriptionStatus String              @default("active") // active | expired | none
+  subscriptionEndsAt DateTime?
+
+  brands    Brand[]
+  products  Product[]
+
+  rfqMatches            RFQManufacturerMatch[]
+  quotations            ManufacturerQuotation[]
+  ordersAsManufacturer  Order[]                 @relation("OrderManufacturer")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model SubscriptionPlan {
+  id           String   @id @default(cuid())
+  code         String   @unique // e.g. "starter", "growth", "enterprise"
+  name         String
+  priceInr     Int
+  listingLimit Int
+  description  String?
+
+  manufacturers ManufacturerProfile[]
+}
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+model Category {
+  id       String     @id @default(cuid())
+  name     String     @unique
+  slug     String     @unique
+  products Product[]
+  rfqs     RFQ[]
+}
+
+model Brand {
+  id             String   @id @default(cuid())
+  manufacturerId String
+  manufacturer   ManufacturerProfile @relation(fields: [manufacturerId], references: [id], onDelete: Cascade)
+  name           String
+  logoUrl        String?
+  description    String?
+  state          String?
+  createdAt      DateTime @default(now())
+
+  products Product[]
+}
+
+// ProductStatus: DRAFT | ACTIVE | PAUSED
+model Product {
+  id                 String        @id @default(cuid())
+  manufacturerId     String
+  manufacturer       ManufacturerProfile @relation(fields: [manufacturerId], references: [id], onDelete: Cascade)
+  brandId            String?
+  brand              Brand?        @relation(fields: [brandId], references: [id])
+  categoryId         String
+  category           Category      @relation(fields: [categoryId], references: [id])
+
+  name               String
+  description        String?
+  images             String?       // comma-separated URLs
+  moq                Int?
+  moqUnit            String        @default("kg")
+  pricePerUnit       Float?
+  currency           String        @default("USD")
+  packagingOptions   String?
+  originState        String?
+  originCountry      String        @default("India")
+  certifications     String?
+  productionCapacity String?
+  exportMarkets      String?
+  availability       Boolean       @default(true)
+  status             String        @default("ACTIVE")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  favorites  Favorite[]
+  enquiries  Enquiry[]
+  orders     Order[]
+}
+
+// ---------------------------------------------------------------------------
+// Buyer engagement
+// ---------------------------------------------------------------------------
+
+model Favorite {
+  id        String   @id @default(cuid())
+  buyerId   String
+  buyer     User     @relation(fields: [buyerId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([buyerId, productId])
+}
+
+// EnquiryStatus: OPEN | RESPONDED | CLOSED
+model Enquiry {
+  id        String        @id @default(cuid())
+  buyerId   String
+  buyer     User          @relation(fields: [buyerId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product       @relation(fields: [productId], references: [id], onDelete: Cascade)
+  message   String
+  status    String        @default("OPEN")
+  createdAt DateTime      @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// RFQ / Bulk Quote workflow
+//
+// Buyer -> RFQ -> matched manufacturers -> ManufacturerQuotation(s) -> Admin
+// reviews/negotiates -> FinalQuotation -> Buyer. Manufacturer quotations are
+// intentionally never exposed to the buyer via the API - only FinalQuotation
+// records are buyer-visible (enforced in the controllers, not just the UI).
+// ---------------------------------------------------------------------------
+
+// RFQStatus:
+//   OPEN      - just submitted, distributed to manufacturers
+//   QUOTED    - at least one manufacturer quotation received
+//   FINALIZED - admin has sent a final quote to the buyer
+//   ACCEPTED  - buyer accepted the final quote
+//   CLOSED    - withdrawn / expired / rejected
+model RFQ {
+  id                      String    @id @default(cuid())
+  buyerId                 String
+  buyer                   User      @relation(fields: [buyerId], references: [id], onDelete: Cascade)
+  productName             String
+  categoryId              String?
+  category                Category? @relation(fields: [categoryId], references: [id])
+  quantity                Float
+  unit                    String    @default("ton")
+  destinationCountry      String
+  specifications          String?
+  certificationsRequired  String?
+  deliveryTimeline        String?
+  additionalRequirements  String?
+  status                  String    @default("OPEN")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  matches          RFQManufacturerMatch[]
+  quotations       ManufacturerQuotation[]
+  finalQuotation   FinalQuotation?
+  messages         Message[]
+  demandRecords    DemandRecord[]
+}
+
+model RFQManufacturerMatch {
+  id             String              @id @default(cuid())
+  rfqId          String
+  rfq            RFQ                 @relation(fields: [rfqId], references: [id], onDelete: Cascade)
+  manufacturerId String
+  manufacturer   ManufacturerProfile @relation(fields: [manufacturerId], references: [id], onDelete: Cascade)
+  notifiedAt     DateTime            @default(now())
+
+  @@unique([rfqId, manufacturerId])
+}
+
+// QuotationStatus: SUBMITTED | SHORTLISTED | REJECTED
+model ManufacturerQuotation {
+  id             String              @id @default(cuid())
+  rfqId          String
+  rfq            RFQ                 @relation(fields: [rfqId], references: [id], onDelete: Cascade)
+  manufacturerId String
+  manufacturer   ManufacturerProfile @relation(fields: [manufacturerId], references: [id], onDelete: Cascade)
+
+  pricePerUnit   Float
+  currency       String   @default("USD")
+  totalPrice     Float
+  leadTimeDays   Int
+  termsNotes     String?
+  certifications String?
+  status         String   @default("SUBMITTED")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([rfqId, manufacturerId])
+}
+
+// FinalQuotationStatus: SENT | ACCEPTED | REJECTED
+// The single admin-curated quote a buyer actually sees for an RFQ.
+model FinalQuotation {
+  id                String   @id @default(cuid())
+  rfqId             String   @unique
+  rfq               RFQ      @relation(fields: [rfqId], references: [id], onDelete: Cascade)
+  preparedByAdminId String
+  finalPricePerUnit Float
+  currency          String   @default("USD")
+  finalTotalPrice   Float
+  deliveryTimeline  String?
+  terms             String?
+  supplierSummary   String?  // admin-written, anonymized description e.g. "2 verified Tamil Nadu manufacturers"
+  status            String   @default("SENT")
+
+  sentAt    DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Demand / Supply intelligence
+//
+// Every RFQ submission (and, optionally, buyer product searches) writes a
+// DemandRecord. The demand map (manufacturer side) and supply map (buyer
+// side) are computed by aggregating these plus the Product/Manufacturer
+// catalog - no raw buyer identity is ever exposed through these endpoints.
+// ---------------------------------------------------------------------------
+
+model DemandRecord {
+  id          String   @id @default(cuid())
+  rfqId       String?
+  rfq         RFQ?     @relation(fields: [rfqId], references: [id], onDelete: SetNull)
+  categoryId  String?
+  productName String
+  country     String
+  region      String?
+  quantity    Float?
+  unit        String?
+  source      String   @default("rfq") // rfq | search
+  createdAt   DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Messaging / orders / notifications
+// ---------------------------------------------------------------------------
+
+model Message {
+  id         String   @id @default(cuid())
+  senderId   String
+  sender     User     @relation("MessageSender", fields: [senderId], references: [id], onDelete: Cascade)
+  receiverId String
+  receiver   User     @relation("MessageReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
+  rfqId      String?
+  rfq        RFQ?     @relation(fields: [rfqId], references: [id], onDelete: SetNull)
+  body       String
+  readAt     DateTime?
+  createdAt  DateTime @default(now())
+}
+
+// OrderStatus: PENDING | CONFIRMED | SHIPPED | DELIVERED | CANCELLED
+model Order {
+  id             String       @id @default(cuid())
+  buyerId        String
+  buyer          User         @relation("OrderBuyer", fields: [buyerId], references: [id], onDelete: Cascade)
+  buyerProfileId String?
+  buyerProfile   BuyerProfile? @relation(fields: [buyerProfileId], references: [id])
+  manufacturerId String
+  manufacturer   ManufacturerProfile @relation("OrderManufacturer", fields: [manufacturerId], references: [id], onDelete: Cascade)
+  productId      String?
+  product        Product?     @relation(fields: [productId], references: [id])
+  quantity       Float
+  unit           String       @default("ton")
+  totalAmount    Float
+  currency       String       @default("USD")
+  status         String       @default("PENDING")
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+}
+
+// Lightweight "Register Your Product" homepage form -- a low-friction way
+// for a small manufacturer to express interest before going through full
+// onboarding. Admin reviews these and converts promising ones into full
+// manufacturer accounts.
+model ProductLead {
+  id          String   @id @default(cuid())
+  name        String
+  phone       String
+  location    String
+  business    String
+  description String
+  status      String   @default("new") // new | contacted | converted | dismissed
+  createdAt   DateTime @default(now())
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  body      String?
+  link      String?
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+}
